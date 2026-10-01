@@ -1,0 +1,8 @@
+@layer components {
+  .accordion {
+    .body {
+      overflow: hidden;
+      transition: height 600ms var(--ease-out-expo);
+    }
+  }
+}

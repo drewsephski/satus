@@ -1,0 +1,266 @@
+'use client'
+
+import dynamic from 'next/dynamic'
+import {
+  createContext,
+  type PropsWithChildren,
+  use,
+  useEffect,
+  useId,
+  useSyncExternalStore,
+} from 'react'
+
+import Orchestra from '@/lib/dev/orchestra'
+import { useAfterLoad } from '@/lib/hooks/use-after-load'
+import { useDeviceDetection } from '@/lib/hooks/use-device-detection'
+import {
+  claimPrimary,
+  getDOMTunnel,
+  getPrimaryClaimId,
+  getServerPrimaryClaimId,
+  getServerRootCanvasRegistered,
+  getWebGLTunnel,
+  isRootCanvasRegistered,
+  registerRootCanvasMount,
+  releasePrimary,
+  subscribePrimaryClaim,
+} from '@/lib/webgl/store'
+import type { tunnel } from '@/webgl/utils/tunnel'
+
+const WebGLCanvas = dynamic(
+  () => import('./webgl').then(({ WebGLCanvas }) => WebGLCanvas),
+  {
+    ssr: false,
+  }
+)
+
+/**
+ * Reads the Orchestra dev panel's 🧊 WebGL toggle (persisted in the same
+ * `orchestra` localStorage store every other panel toggle uses). Defaults to
+ * `true` — matches the toggle's own `defaultValue` in `lib/dev/cmdo.tsx` and
+ * the "on by default" behaviour documented in `lib/dev/README.md`.
+ *
+ * Collapses to a constant `true` in production: `process.env.NODE_ENV` is
+ * inlined at build time, so the subscription never runs and minification
+ * drops the dead branch — no persisted dev-panel state leaks into what
+ * production visitors render.
+ */
+const NOOP_UNSUBSCRIBE = () => {
+  // Production: nothing is subscribed, so nothing to tear down.
+}
+
+const subscribeToWebGLToggle = (onChange: () => void) =>
+  process.env.NODE_ENV === 'development'
+    ? Orchestra.subscribe((state) => state.webgl, onChange)
+    : NOOP_UNSUBSCRIBE
+
+const getWebGLToggle = () =>
+  process.env.NODE_ENV === 'development'
+    ? (Orchestra.getState().webgl ?? true)
+    : true
+
+// The toggle only exists in the browser; SSR always renders as enabled so the
+// server and the first client paint agree.
+const getWebGLToggleServerSnapshot = () => true
+
+function useWebGLDevKillSwitch(): boolean {
+  return useSyncExternalStore(
+    subscribeToWebGLToggle,
+    getWebGLToggle,
+    getWebGLToggleServerSnapshot
+  )
+}
+
+type TunnelInstance = ReturnType<typeof tunnel>
+
+type CanvasContextValue =
+  | { active: false }
+  | { active: true; WebGLTunnel: TunnelInstance; DOMTunnel: TunnelInstance }
+
+type CanvasProps = PropsWithChildren<{
+  /**
+   * Mount the WebGL canvas, backed by the shared store tunnels. Mount it once
+   * — either in the shared layout (persists across routes) or per page via
+   * `<Wrapper webgl>`. Without it, children fall back to whichever root canvas
+   * is mounted, via {@link useCanvas}.
+   */
+  root?: boolean
+  /** Force WebGL even on mobile/non-WebGL devices */
+  force?: boolean
+  /**
+   * Which GPU simulations `FlowmapProvider` mounts (root canvas only).
+   * Defaults to none (opt-in) — pass the sims you actually use, e.g.
+   * `['flowmap']`, to avoid paying for a GPU pass and window listeners with
+   * no consumer.
+   */
+  simTypes?: ('fluid' | 'flowmap')[]
+}>
+
+export const CanvasContext = createContext<CanvasContextValue>({
+  active: false,
+})
+
+/**
+ * Canvas component that provides WebGL context and the tunnel system.
+ *
+ * `root` mounts the actual canvas; mount exactly one across the app (in the
+ * layout for a persistent canvas, or per page via `<Wrapper webgl>`). A
+ * non-root `<Canvas>` mounts nothing and just lets children reach the root
+ * canvas through {@link useCanvas}.
+ *
+ * @example
+ * ```tsx
+ * // Shared canvas, mounted once in the root layout
+ * <Canvas root />
+ *
+ * // Portal content from anywhere
+ * <WebGLTunnel>
+ *   <My3DScene />
+ * </WebGLTunnel>
+ * ```
+ */
+export function Canvas({
+  children,
+  root = false,
+  force = false,
+  simTypes,
+  ...props
+}: CanvasProps) {
+  const { isWebGL, isReducedMotion } = useDeviceDetection()
+  const webglDevToggleEnabled = useWebGLDevKillSwitch()
+  const afterLoad = useAfterLoad()
+
+  // Only a root canvas mounts the WebGL surface; it uses the shared store
+  // tunnels so content portals into it from anywhere. A non-root <Canvas> is a
+  // passthrough whose children fall back to the root canvas via useCanvas().
+  const WebGLTunnel = root ? getWebGLTunnel() : undefined
+  const DOMTunnel = root ? getDOMTunnel() : undefined
+
+  // `force` is an explicit escape hatch — it bypasses the WebGL capability
+  // check, the reduced-motion preference, and the after-load gate.
+  //
+  // The after-load gate (`useAfterLoad`) keeps the renderer boot and shader
+  // compile off the critical path: during hydration that work is billed as
+  // blocking time against pixels the DOM is already painting, so the canvas
+  // mounts once `window.load` fires instead. `force` skips it because a
+  // canvas that carries CONTENT (not decoration) may need to be up for first
+  // paint; the cost of that choice is the blocking time this gate exists to
+  // avoid, so `force` should come with a measurement.
+  //
+  // ⚠ Because reduced-motion (and non-WebGL devices) means the canvas may
+  // never mount, anything that puts CONTENT in WebGL — not just decoration —
+  // must account for a fallback for this state: render a static image / DOM
+  // equivalent when the canvas is absent, or mount with `force` and damp
+  // motion inside the scene.
+  //
+  // The Orchestra panel's 🧊 toggle is a dev-only kill switch on top of all
+  // of that (including `force`) — useful for isolating perf work to the DOM
+  // side of a page without physically deleting `<Canvas root>`.
+  const shouldRender =
+    webglDevToggleEnabled &&
+    root &&
+    ((isWebGL && !isReducedMotion && afterLoad) || force)
+  const contextValue: CanvasContextValue =
+    WebGLTunnel && DOMTunnel
+      ? { active: true, WebGLTunnel, DOMTunnel }
+      : { active: false }
+
+  // Guard against two <Canvas root> instances both mounting the WebGL surface
+  // at once (e.g. layout canvas + <Wrapper webgl> on the same page). Two
+  // instances rendering in the same commit both read `primaryClaimId ===
+  // undefined` from a post-commit-only source, so both would optimistically
+  // mount a full r3f Canvas + WebGLRenderer for that one commit — the claim
+  // below is decided synchronously in the render body instead (a token, not
+  // the GL resource itself, which still only ever mounts via normal
+  // JSX/effects), so the second instance in the same commit already sees the
+  // first instance's claim. `claimPrimary` is idempotent per id, so React
+  // Strict Mode's double-render of a single instance is safe. Subscribing via
+  // useSyncExternalStore exists only to re-render this instance when the
+  // claim changes elsewhere (e.g. the primary unmounted and a survivor was
+  // promoted) — its return value isn't used, `claimPrimary` is the source of
+  // truth for `isPrimary`. Release happens in the mounting effect's cleanup,
+  // never from render, and promotes the next registered candidate.
+  const id = useId()
+  useSyncExternalStore(
+    subscribePrimaryClaim,
+    getPrimaryClaimId,
+    getServerPrimaryClaimId
+  )
+  const canMount = contextValue.active && shouldRender
+  const isPrimary = canMount && claimPrimary(id)
+  const isMounting = isPrimary
+
+  useEffect(() => {
+    if (!canMount) return
+    const unregister = registerRootCanvasMount(id)
+    return () => {
+      unregister()
+      releasePrimary(id)
+    }
+  }, [canMount, id])
+
+  return (
+    <CanvasContext.Provider value={contextValue}>
+      {isMounting && <WebGLCanvas {...props} {...(simTypes && { simTypes })} />}
+      {children}
+    </CanvasContext.Provider>
+  )
+}
+
+/**
+ * Reactive read of {@link isRootCanvasRegistered} — re-renders the caller
+ * when a `<Canvas root>` mounts or unmounts anywhere in the tree. Consumers
+ * that hide DOM content in favor of a WebGL replacement (e.g. `Image`) need
+ * this: mount order isn't guaranteed (a tunnel consumer can render before or
+ * after the root canvas, or across a route change), so a mount-time snapshot
+ * would go stale.
+ */
+export function useRootCanvasMounted(): boolean {
+  return useSyncExternalStore(
+    subscribePrimaryClaim,
+    isRootCanvasRegistered,
+    getServerRootCanvasRegistered
+  )
+}
+
+// Warned-once guard for the dev-only notice below, mirroring the multi-root
+// warning in store.ts — one console.warn per occurrence, not just per page
+// load, so it fires again if the misconfiguration recurs later in the
+// session (e.g. a root canvas unmounts and nothing replaces it).
+let hasWarnedFallbackWithNoRoot = false
+
+/**
+ * Hook to access the Canvas context (tunnels for WebGL and DOM content).
+ */
+export function useCanvas() {
+  const localContext = use(CanvasContext)
+  const rootCanvasMounted = useRootCanvasMounted()
+  const usesFallback = !localContext.active
+
+  // Fall back to the root singletons — the tunnels always exist once the
+  // store is loaded, but nothing is listening on the other end unless a
+  // `<Canvas root>` is actually mounted somewhere. Warn loudly in dev so
+  // that misconfiguration (e.g. forgetting `<Canvas root>` in the layout and
+  // never using `<Wrapper webgl>`) doesn't read as a silent blank instead.
+  // Runs in an effect, not render, so the warned-once module flag is only
+  // ever mutated as a post-commit side effect.
+  useEffect(() => {
+    if (process.env.NODE_ENV !== 'development') return
+    if (usesFallback && !rootCanvasMounted && !hasWarnedFallbackWithNoRoot) {
+      hasWarnedFallbackWithNoRoot = true
+      console.warn(
+        'useCanvas() fell back to the shared tunnels but no <Canvas root> is mounted — portaled content has nothing to render into. Mount <Canvas root> in the layout or via <Wrapper webgl>.'
+      )
+    } else if (rootCanvasMounted) {
+      hasWarnedFallbackWithNoRoot = false
+    }
+  }, [usesFallback, rootCanvasMounted])
+
+  if (localContext.active) return localContext
+
+  return {
+    active: true as const,
+    WebGLTunnel: getWebGLTunnel(),
+    DOMTunnel: getDOMTunnel(),
+  }
+}
